@@ -3,18 +3,41 @@ import * as tf from "@tensorflow/tfjs";
 import * as handpose from "@tensorflow-models/handpose";
 import Webcam from "react-webcam";
 import "./App.css";
-import { drawHand } from "./utilities";
+import { drawHand, voteAndDraw } from "./utilities";
+
+/**
+ * Ative se estiver vendo inversão entre "dia" e "emergencia".
+ * true  => troca os dois rótulos
+ * false => mantém como detectado
+ */
+const SWAP_DIA_EMERGENCIA = true;
+
+// Exige estabilidade do gesto por N frames antes de aceitar
+const HOLD_FRAMES = 6;
+// Tempo mínimo entre passos aceitos (evita repetição)
+const COOL_DOWN_MS = 1500;
 
 function App() {
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
+  const intervalRef = useRef(null);
+
   const [gesture, setGesture] = useState("");
   const [currentStep, setCurrentStep] = useState(0);
   const [detectedPhrase, setDetectedPhrase] = useState([]);
   const [lastDetectionTime, setLastDetectionTime] = useState(0);
 
-  // Sequência da frase que queremos detectar
-  const targetPhrase = ["bom", "dia", "emergencia"];
+  // 🔄 Sequência da frase
+  const targetPhrase = ["bom", "emergencia", "dia"];
+
+  // --- Refs para evitar "estado congelado" dentro do setInterval ---
+  const stepRef = useRef(currentStep);
+  const lastTimeRef = useRef(lastDetectionTime);
+  useEffect(() => { stepRef.current = currentStep; }, [currentStep]);
+  useEffect(() => { lastTimeRef.current = lastDetectionTime; }, [lastDetectionTime]);
+
+  // Contador de estabilidade por frames
+  const holdRef = useRef({ label: null, count: 0 });
 
   // Função auxiliar para calcular distância entre pontos
   const calculateDistance = (point1, point2) => {
@@ -23,62 +46,70 @@ function App() {
     return Math.sqrt(dx * dx + dy * dy);
   };
 
+  // Distância normalizada por uma base da mão (wrist → mcp do dedo médio)
+  const normalizedDistance = (p1, p2, landmarks) => {
+    const baseA = landmarks[0];  // wrist
+    const baseB = landmarks[9];  // middle_finger_mcp
+    const base = calculateDistance(baseA, baseB) || 1;
+    return calculateDistance(p1, p2) / base;
+  };
+
+  // Aplica alias para corrigir inversão (se habilitado)
+  const alias = (label) => {
+    if (!SWAP_DIA_EMERGENCIA) return label;
+    if (label === "dia") return "emergencia";
+    if (label === "emergencia") return "dia";
+    return label;
+  };
+
+  // Classificador heurístico com distâncias normalizadas
   const classifyGesture = (hand) => {
-    const landmarks = hand.landmarks;
-    
-    const thumbTip = landmarks[4];
-    const indexTip = landmarks[8];
-    const middleTip = landmarks[12];
-    
-    const thumbIndexDistance = calculateDistance(thumbTip, indexTip);
-    const indexMiddleDistance = calculateDistance(indexTip, middleTip);
-    
-    console.log(`DEBUG: thumb-index=${thumbIndexDistance.toFixed(0)}, index-middle=${indexMiddleDistance.toFixed(0)}`);
-    
-    // Gesto "bom" - mão fechada
-    if (thumbIndexDistance < 60 && indexMiddleDistance < 60) {
-      console.log("✅ Detectado: BOM");
-      return "bom";
-    }
-    
-    // Gesto "dia" - só indicador estendido (dedos MÉDIO, ANELAR, MINDINHO FECHADOS)
-    if (thumbIndexDistance > 160 && indexMiddleDistance < 120) {
-      console.log("✅ Detectado: DIA");
-      return "dia";
-    }
-    
-    // Gesto "emergencia" - mão aberta (todos dedos SEPARADOS)
-    if (thumbIndexDistance > 160 && indexMiddleDistance > 150) {
-      console.log("✅ Detectado: EMERGENCIA");
-      return "emergencia";
-    }
-    
-    console.log("❌ Nenhum gesto reconhecido");
+    const lm = hand.landmarks;
+
+    const thumbTip  = lm[4];
+    const indexTip  = lm[8];
+    const middleTip = lm[12];
+
+    // Distâncias normalizadas (invariantes à escala)
+    const thumbIndex  = normalizedDistance(thumbTip, indexTip, lm);   // polegar ↔ indicador
+    const indexMiddle = normalizedDistance(indexTip, middleTip, lm);  // indicador ↔ médio
+
+    // DEBUG (ajude-se ajustando os limites com base nesses números)
+    console.log(`DEBUG norm: t-i=${thumbIndex.toFixed(2)} | i-m=${indexMiddle.toFixed(2)}`);
+
+    // 1) "bom" = mão fechada (ambas pequenas)
+    if (thumbIndex < 0.50 && indexMiddle < 0.50) return "bom";
+
+    // 2) "emergencia" = mão aberta (bem separadas)
+    if (thumbIndex > 1.05 && indexMiddle > 0.95) return "emergencia";
+
+    // 3) "dia" = indicador estendido; demais próximos (médio não tão aberto)
+    if (thumbIndex > 0.90 && indexMiddle >= 0.40 && indexMiddle <= 0.70) return "dia";
+
     return null;
   };
 
-  // 🔥 FUNÇÃO runHandpose ADICIONADA AQUI
   const runHandpose = async () => {
     try {
-      // Carregar modelo de detecção de mãos
       const net = await handpose.load();
-      console.log('Modelo HandPose carregado!');
-      
+      console.log("Modelo HandPose carregado!");
+
       // Loop de detecção
-      setInterval(() => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      intervalRef.current = setInterval(() => {
         detect(net);
       }, 100);
     } catch (error) {
-      console.error('Erro ao carregar handpose:', error);
+      console.error("Erro ao carregar handpose:", error);
     }
   };
 
   const detect = async (net) => {
-    if (!webcamRef.current || 
-        !webcamRef.current.video || 
-        webcamRef.current.video.readyState !== 4) {
-      return;
-    }
+    if (
+      !webcamRef.current ||
+      !webcamRef.current.video ||
+      webcamRef.current.video.readyState !== 4
+    ) return;
 
     const video = webcamRef.current.video;
     const videoWidth = video.videoWidth;
@@ -91,32 +122,58 @@ function App() {
     canvasRef.current.height = videoHeight;
 
     try {
-      // Fazer detecção de mãos
+      // Detecção de mãos
       const hands = await net.estimateHands(video);
       const ctx = canvasRef.current.getContext("2d");
-      
+
       // Limpar canvas
       ctx.clearRect(0, 0, videoWidth, videoHeight);
-      
+
       if (hands.length > 0) {
+        // Desenha mão
         drawHand(hands, ctx);
-        const detectedGesture = classifyGesture(hands[0]);
-        
-        if (detectedGesture) {
-          setGesture(detectedGesture); // Mostra sempre o último detectado
+
+        // Heurística de gesto
+        const rawGesture = classifyGesture(hands[0]);
+
+        // Mostrar sempre o último detectado bruto
+        if (rawGesture) setGesture(rawGesture);
+
+        // Suavização por voto (escreve "↳ <label>" no canto)
+        let stable = null;
+        if (rawGesture) stable = voteAndDraw(rawGesture, ctx);
+        if (!stable) return;
+
+        // Corrige inversão se necessário
+        const label = alias(stable);
+
+        const expected = targetPhrase[stepRef.current];
+        // Atualiza contagem de estabilidade por frames
+        if (label === expected) {
+          if (holdRef.current.label === label) {
+            holdRef.current.count += 1;
+          } else {
+            holdRef.current = { label, count: 1 };
+          }
+        } else {
+          holdRef.current = { label: null, count: 0 };
         }
-        
-        // Só avança se for o próximo gesto correto na sequência
-        if (detectedGesture && detectedGesture === targetPhrase[currentStep]) {
+
+        // Aceita passo quando estável e respeita cooldown
+        if (
+          label === expected &&
+          holdRef.current.count >= HOLD_FRAMES
+        ) {
           const now = Date.now();
-          if (now - lastDetectionTime > 2000) { // 2 segundos
-            console.log(`🎉 AVANÇANDO: ${detectedGesture} -> Próximo: ${targetPhrase[currentStep + 1] || 'COMPLETO'}`);
-            setDetectedPhrase(prev => [...prev, detectedGesture]);
-            setCurrentStep(prev => prev + 1);
+          if (now - lastTimeRef.current > COOL_DOWN_MS) {
+            setDetectedPhrase((prev) => [...prev, label]);
+            setCurrentStep((prev) => prev + 1);
             setLastDetectionTime(now);
-            
-            // Reset após completar a frase
-            if (currentStep >= targetPhrase.length - 1) {
+            holdRef.current = { label: null, count: 0 };
+
+            // Se completou a frase, reinicia após 3s
+            const willBeStep = stepRef.current + 1;
+            if (willBeStep >= targetPhrase.length) {
               setTimeout(() => {
                 setCurrentStep(0);
                 setDetectedPhrase([]);
@@ -127,13 +184,19 @@ function App() {
         }
       }
     } catch (error) {
-      console.error('Erro na detecção:', error);
+      console.error("Erro na detecção:", error);
     }
   };
 
   useEffect(() => {
     runHandpose();
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const nextLabel = targetPhrase[currentStep] ?? "COMPLETO";
 
   return (
     <div className="App">
@@ -151,6 +214,8 @@ function App() {
             zIndex: 9,
             width: 640,
             height: 480,
+            // Se quiser espelhar a imagem para parecer "espelho":
+            // transform: "scaleX(-1)",
           }}
         />
 
@@ -170,18 +235,24 @@ function App() {
         />
 
         {/* Display da frase sendo montada */}
-        <div style={{
-          position: "absolute",
-          top: '500px',
-          fontSize: '24px',
-          color: 'white',
-          backgroundColor: 'rgba(0,0,0,0.7)',
-          padding: '10px',
-          borderRadius: '10px',
-          textAlign: 'center'
-        }}>
-          <div>Frase Montada: <strong>{detectedPhrase.join(" ")}</strong></div>
-          <div>Próximo Gestos: <strong>{targetPhrase[currentStep]}</strong></div>
+        <div
+          style={{
+            position: "absolute",
+            top: "500px",
+            fontSize: "24px",
+            color: "white",
+            backgroundColor: "rgba(0,0,0,0.7)",
+            padding: "10px",
+            borderRadius: "10px",
+            textAlign: "center",
+          }}
+        >
+          <div>
+            Frase Montada: <strong>{detectedPhrase.join(" ")}</strong>
+          </div>
+          <div>
+            Próximo Gesto: <strong>{nextLabel}</strong>
+          </div>
           <div>Último Detectado: {gesture}</div>
         </div>
       </header>
