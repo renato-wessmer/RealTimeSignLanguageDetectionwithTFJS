@@ -1,86 +1,104 @@
-// Import dependencies
-import React, { useRef, useState, useEffect } from "react";
+import React, { useRef, useEffect, useState } from "react";
 import * as tf from "@tensorflow/tfjs";
+import * as handpose from "@tensorflow-models/handpose";
 import Webcam from "react-webcam";
 import "./App.css";
-import { nextFrame } from "@tensorflow/tfjs";
-// 2. TODO - Import drawing utility here
-// e.g. import { drawRect } from "./utilities";
-import {drawRect} from "./utilities"; 
+import { drawHand } from "./utilities";
 
 function App() {
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
+  const [gesture, setGesture] = useState("");
+  const [currentStep, setCurrentStep] = useState(0);
+  const [detectedPhrase, setDetectedPhrase] = useState([]);
 
-  // Main function
-  const runCoco = async () => {
-    // 3. TODO - Load network 
-    // e.g. const net = await cocossd.load();
-    // https://tensorflowjsrealtimemodel.s3.au-syd.cloud-object-storage.appdomain.cloud/model.json
-    const net = await tf.loadGraphModel('https://tensorflowjsrealtimemodel.s3.au-syd.cloud-object-storage.appdomain.cloud/model.json')
-    
-    //  Loop and detect hands
-    setInterval(() => {
-      detect(net);
-    }, 16.7);
-  };
+  // Sequência da frase que queremos detectar
+  const targetPhrase = ["bom", "dia", "emergencia"];
 
-  const detect = async (net) => {
-    // Check data is available
-    if (
-      typeof webcamRef.current !== "undefined" &&
-      webcamRef.current !== null &&
-      webcamRef.current.video.readyState === 4
-    ) {
-      // Get Video Properties
-      const video = webcamRef.current.video;
-      const videoWidth = webcamRef.current.video.videoWidth;
-      const videoHeight = webcamRef.current.video.videoHeight;
-
-      // Set video width
-      webcamRef.current.video.width = videoWidth;
-      webcamRef.current.video.height = videoHeight;
-
-      // Set canvas height and width
-      canvasRef.current.width = videoWidth;
-      canvasRef.current.height = videoHeight;
-
-      // 4. TODO - Make Detections
-      const img = tf.browser.fromPixels(video)
-      const resized = tf.image.resizeBilinear(img, [640,480])
-      const casted = resized.cast('int32')
-      const expanded = casted.expandDims(0)
-      const obj = await net.executeAsync(expanded)
-      console.log(obj)
-
-      const boxes = await obj[1].array()
-      const classes = await obj[2].array()
-      const scores = await obj[4].array()
+  const runHandpose = async () => {
+    try {
+      // Carregar modelo de detecção de mãos
+      const net = await handpose.load();
+      console.log('Modelo HandPose carregado!');
       
-      // Draw mesh
-      const ctx = canvasRef.current.getContext("2d");
-
-      // 5. TODO - Update drawing utility
-      // drawSomething(obj, ctx)  
-      requestAnimationFrame(()=>{drawRect(boxes[0], classes[0], scores[0], 0.8, videoWidth, videoHeight, ctx)}); 
-
-      tf.dispose(img)
-      tf.dispose(resized)
-      tf.dispose(casted)
-      tf.dispose(expanded)
-      tf.dispose(obj)
-
+      // Loop de detecção
+      setInterval(() => {
+        detect(net);
+      }, 100);
+    } catch (error) {
+      console.error('Erro ao carregar handpose:', error);
     }
   };
 
-  useEffect(()=>{runCoco()},[]);
+  const detect = async (net) => {
+    if (!webcamRef.current || 
+        !webcamRef.current.video || 
+        webcamRef.current.video.readyState !== 4) {
+      return;
+    }
+
+    const video = webcamRef.current.video;
+    const videoWidth = video.videoWidth;
+    const videoHeight = video.videoHeight;
+
+    // Definir dimensões
+    webcamRef.current.video.width = videoWidth;
+    webcamRef.current.video.height = videoHeight;
+    canvasRef.current.width = videoWidth;
+    canvasRef.current.height = videoHeight;
+
+    try {
+      // Fazer detecção de mãos
+      const hands = await net.estimateHands(video);
+      const ctx = canvasRef.current.getContext("2d");
+      
+      // Limpar canvas
+      ctx.clearRect(0, 0, videoWidth, videoHeight);
+      
+      if (hands.length > 0) {
+        // Desenhar pontos da mão
+        drawHand(hands, ctx);
+        
+        // TODO: Aqui vamos classificar o gesto
+        const detectedGesture = classifyGesture(hands[0]);
+        
+        if (detectedGesture && detectedGesture === targetPhrase[currentStep]) {
+          // Gestos correto detectado!
+          setGesture(detectedGesture);
+          setDetectedPhrase(prev => [...prev, detectedGesture]);
+          setCurrentStep(prev => prev + 1);
+          
+          // Reset após completar a frase
+          if (currentStep >= targetPhrase.length - 1) {
+            setTimeout(() => {
+              setCurrentStep(0);
+              setDetectedPhrase([]);
+            }, 3000);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Erro na detecção:', error);
+    }
+  };
+
+  // Função temporária - vamos implementar a classificação real
+  const classifyGesture = (hand) => {
+    // SIMULAÇÃO - substituir por modelo real de classificação
+    const gestures = ["bom", "dia", "emergencia"];
+    return gestures[Math.floor(Math.random() * gestures.length)];
+  };
+
+  useEffect(() => {
+    runHandpose();
+  }, []);
 
   return (
     <div className="App">
       <header className="App-header">
         <Webcam
           ref={webcamRef}
-          muted={true} 
+          muted={true}
           style={{
             position: "absolute",
             marginLeft: "auto",
@@ -88,7 +106,7 @@ function App() {
             left: 0,
             right: 0,
             textAlign: "center",
-            zindex: 9,
+            zIndex: 9,
             width: 640,
             height: 480,
           }}
@@ -103,11 +121,26 @@ function App() {
             left: 0,
             right: 0,
             textAlign: "center",
-            zindex: 8,
+            zIndex: 8,
             width: 640,
             height: 480,
           }}
         />
+
+        {/* Display da frase sendo montada */}
+        <div style={{
+          position: "absolute",
+          top: '500px',
+          fontSize: '24px',
+          color: 'white',
+          backgroundColor: 'rgba(0,0,0,0.7)',
+          padding: '10px',
+          borderRadius: '10px'
+        }}>
+          <div>Frase: {detectedPhrase.join(" ")}</div>
+          <div>Próximo: {targetPhrase[currentStep]}</div>
+          <div>Gestos detectado: {gesture}</div>
+        </div>
       </header>
     </div>
   );
